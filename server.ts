@@ -617,37 +617,6 @@ app.put('/api/contacts/:listName/:id', requireAuth as any, async (req: AuthReque
 });
 
 // GET Campaigns (user-scoped)
-// Tracking pixel endpoint — public (no auth) since email clients load it directly
-// Route looks like a normal image request to avoid spam filters
-app.get(['/img/:id.png', '/api/track/:id'], async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    // Record the open event
-    const result = await query(
-      "UPDATE email_queue SET opened_at = COALESCE(opened_at, NOW()), opened_count = opened_count + 1 WHERE id = $1 AND status = 'success' RETURNING campaign_id",
-      [id]
-    );
-
-    if (result.rows.length > 0) {
-      const campaignId = result.rows[0].campaign_id;
-      // Increment campaign opened_count (fire-and-forget)
-      query('UPDATE campaigns SET opened_count = opened_count + 1 WHERE id = $1', [campaignId]).catch(() => {});
-    }
-  } catch (e) {
-    // Silently ignore tracking errors — never break the email client
-  }
-
-  // Return 1x1 transparent PNG — looks like a normal image response
-  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAABJRUEFTkSuQmCC', 'base64');
-  res.setHeader('Content-Type', 'image/png');
-  res.setHeader('Content-Length', png.length);
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  res.send(png);
-});
-
 app.get('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => {
   try {
     const result = await query(
@@ -655,7 +624,7 @@ app.get('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => {
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", opened_count as "openedCount", created_at as "createdAt", started_at as "startedAt",
+       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
        reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.user!.id]
@@ -742,12 +711,8 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
 
       if (updates.status === 'running' && campaign.status !== 'running') {
         await query('UPDATE campaigns SET started_at = COALESCE(started_at, NOW()) WHERE id = $1', [id]);
-        // Derive base URL from the incoming request for tracking pixel URLs
-        const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
-        const host = req.get('host') || 'localhost:3000';
-        const baseUrl = process.env.BASE_URL || `${protocol}://${host}`;
         // Run queue initialization in the background — don't block the API response
-        initializeCampaignQueue(campaign, userId, baseUrl)
+        initializeCampaignQueue(campaign, userId)
           .catch((e: any) => console.error('Async queue init error:', e));
       }
 
@@ -775,7 +740,7 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", opened_count as "openedCount", created_at as "createdAt", started_at as "startedAt",
+       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
        reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE id = $1`, [id]
     );
@@ -1102,7 +1067,7 @@ app.get('/api/admin/stats', requireAuth as any, requireAdmin as any, async (req:
    QUEUE MANAGEMENT & RUNNER
    ========================================================================== */
 
-async function initializeCampaignQueue(campaign: any, userId: number, baseUrl?: string) {
+async function initializeCampaignQueue(campaign: any, userId: number) {
   // Check if queue items already exist
   const existingResult = await query(
     'SELECT COUNT(*) as count FROM email_queue WHERE campaign_id = $1',
@@ -1167,9 +1132,6 @@ async function initializeCampaignQueue(campaign: any, userId: number, baseUrl?: 
     intervalMs = Math.max(1, Math.round((3600 / (ratePerHourPerAcct * activeSendersNum)) * 1000));
   }
 
-  // Base URL for tracking pixel — derived from request or env, never localhost in production
-  const trackingBaseUrl = baseUrl || process.env.BASE_URL || 'http://localhost:3000';
-
   // Process contacts in batches of 1000 to avoid memory issues with 50K+ contacts
   const QUEUE_BATCH_SIZE = 1000;
   let globalIdx = 0;
@@ -1227,17 +1189,14 @@ async function initializeCampaignQueue(campaign: any, userId: number, baseUrl?: 
         });
       }
 
-      const queueId = Math.random().toString(36).substr(2, 9);
-      ids.push(queueId);
+      ids.push(Math.random().toString(36).substr(2, 9));
       userIds.push(userId);
       campaignIds.push(campaign.id);
       recipientEmails.push(contact.email);
       recipientNames.push(contact.name || '');
       senderEmails.push(senderEmail);
       subjects.push(personalizedSubject);
-      // Append tracking pixel — looks like a normal logo/signature image to avoid spam filters
-      const trackingPixel = `<img src="${trackingBaseUrl}/img/${queueId}.png" alt="Logo" style="border:0;outline:none;text-decoration:none;max-width:100%;height:auto" />`;
-      bodies.push(personalizedBody + trackingPixel);
+      bodies.push(personalizedBody);
       delayUntils.push(now + (globalIdx * intervalMs));
 
       globalIdx++;
