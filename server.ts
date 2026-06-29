@@ -706,12 +706,15 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
 
     // Handle status transitions
     if (updates.status && updates.status !== campaign.status) {
-      if (updates.status === 'running' && campaign.status !== 'running') {
-        await initializeCampaignQueue(campaign, userId);
-        await query('UPDATE campaigns SET started_at = COALESCE(started_at, NOW()) WHERE id = $1', [id]);
-      }
       // Update status immediately so the API responds fast
       await query('UPDATE campaigns SET status = $1 WHERE id = $2', [updates.status, id]);
+
+      if (updates.status === 'running' && campaign.status !== 'running') {
+        await query('UPDATE campaigns SET started_at = COALESCE(started_at, NOW()) WHERE id = $1', [id]);
+        // Run queue initialization in the background — don't block the API response
+        initializeCampaignQueue(campaign, userId)
+          .catch((e: any) => console.error('Async queue init error:', e));
+      }
 
       // For stop/pause: clean up the email queue asynchronously so the response is not blocked
       if (updates.status === 'stopped') {
@@ -1090,16 +1093,18 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
       [campaign.id]
     );
 
-    const pendingItems = await query(
-      'SELECT id FROM email_queue WHERE campaign_id = $1 AND status = $2 ORDER BY delay_until ASC',
-      [campaign.id, 'pending']
+    // Batch-reschedule all pending items using a single query with row_number()
+    // instead of updating one-by-one in a loop (which is very slow for large queues)
+    await query(
+      `UPDATE email_queue SET delay_until = $1 + (rn::bigint * $2)
+       FROM (
+         SELECT id, ROW_NUMBER() OVER (ORDER BY delay_until ASC) as rn
+         FROM email_queue
+         WHERE campaign_id = $3 AND status = 'pending'
+       ) sub
+       WHERE email_queue.id = sub.id`,
+      [now, intervalMs, campaign.id]
     );
-
-    let runningDelay = 1000;
-    for (const item of pendingItems.rows) {
-      await query('UPDATE email_queue SET delay_until = $1 WHERE id = $2', [now + runningDelay, item.id]);
-      runningDelay += intervalMs;
-    }
     return;
   }
 
