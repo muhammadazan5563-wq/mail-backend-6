@@ -617,6 +617,36 @@ app.put('/api/contacts/:listName/:id', requireAuth as any, async (req: AuthReque
 });
 
 // GET Campaigns (user-scoped)
+// Tracking pixel endpoint — public (no auth) since email clients load it directly
+app.get('/api/track/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Record the open event
+    const result = await query(
+      "UPDATE email_queue SET opened_at = COALESCE(opened_at, NOW()), opened_count = opened_count + 1 WHERE id = $1 AND status = 'success' RETURNING campaign_id",
+      [id]
+    );
+
+    if (result.rows.length > 0) {
+      const campaignId = result.rows[0].campaign_id;
+      // Increment campaign opened_count (fire-and-forget)
+      query('UPDATE campaigns SET opened_count = opened_count + 1 WHERE id = $1', [campaignId]).catch(() => {});
+    }
+  } catch (e) {
+    // Silently ignore tracking errors — never break the email client
+  }
+
+  // Return 1x1 transparent GIF
+  const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  res.setHeader('Content-Type', 'image/gif');
+  res.setHeader('Content-Length', gif.length);
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.send(gif);
+});
+
 app.get('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => {
   try {
     const result = await query(
@@ -624,7 +654,7 @@ app.get('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => {
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
+       failed_count as "failedCount", opened_count as "openedCount", created_at as "createdAt", started_at as "startedAt",
        reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.user!.id]
@@ -740,7 +770,7 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
+       failed_count as "failedCount", opened_count as "openedCount", created_at as "createdAt", started_at as "startedAt",
        reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE id = $1`, [id]
     );
@@ -1189,14 +1219,17 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
         });
       }
 
-      ids.push(Math.random().toString(36).substr(2, 9));
+      const queueId = Math.random().toString(36).substr(2, 9);
+      ids.push(queueId);
       userIds.push(userId);
       campaignIds.push(campaign.id);
       recipientEmails.push(contact.email);
       recipientNames.push(contact.name || '');
       senderEmails.push(senderEmail);
       subjects.push(personalizedSubject);
-      bodies.push(personalizedBody);
+      // Append tracking pixel to email body for open tracking
+      const trackingPixel = `<img src="${process.env.BASE_URL || 'http://localhost:3001'}/api/track/${queueId}" width="1" height="1" alt="" style="display:none;border:0;outline:none;text-decoration:none" />`;
+      bodies.push(personalizedBody + trackingPixel);
       delayUntils.push(now + (globalIdx * intervalMs));
 
       globalIdx++;
