@@ -741,8 +741,12 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
 
       if (updates.status === 'running' && campaign.status !== 'running') {
         await query('UPDATE campaigns SET started_at = COALESCE(started_at, NOW()) WHERE id = $1', [id]);
+        // Derive base URL from the incoming request for tracking pixel URLs
+        const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+        const host = req.get('host') || 'localhost:3000';
+        const baseUrl = process.env.BASE_URL || `${protocol}://${host}`;
         // Run queue initialization in the background — don't block the API response
-        initializeCampaignQueue(campaign, userId)
+        initializeCampaignQueue(campaign, userId, baseUrl)
           .catch((e: any) => console.error('Async queue init error:', e));
       }
 
@@ -1097,7 +1101,7 @@ app.get('/api/admin/stats', requireAuth as any, requireAdmin as any, async (req:
    QUEUE MANAGEMENT & RUNNER
    ========================================================================== */
 
-async function initializeCampaignQueue(campaign: any, userId: number) {
+async function initializeCampaignQueue(campaign: any, userId: number, baseUrl?: string) {
   // Check if queue items already exist
   const existingResult = await query(
     'SELECT COUNT(*) as count FROM email_queue WHERE campaign_id = $1',
@@ -1161,6 +1165,9 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
     const ratePerHourPerAcct = campaign.emails_per_hour_per_account || 100;
     intervalMs = Math.max(1, Math.round((3600 / (ratePerHourPerAcct * activeSendersNum)) * 1000));
   }
+
+  // Base URL for tracking pixel — derived from request or env, never localhost in production
+  const trackingBaseUrl = baseUrl || process.env.BASE_URL || 'http://localhost:3000';
 
   // Process contacts in batches of 1000 to avoid memory issues with 50K+ contacts
   const QUEUE_BATCH_SIZE = 1000;
@@ -1228,7 +1235,7 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
       senderEmails.push(senderEmail);
       subjects.push(personalizedSubject);
       // Append tracking pixel to email body for open tracking
-      const trackingPixel = `<img src="${process.env.BASE_URL || 'http://localhost:3001'}/api/track/${queueId}" width="1" height="1" alt="" style="display:none;border:0;outline:none;text-decoration:none" />`;
+      const trackingPixel = `<img src="${trackingBaseUrl}/api/track/${queueId}" width="1" height="1" alt="" style="display:none;border:0;outline:none;text-decoration:none" />`;
       bodies.push(personalizedBody + trackingPixel);
       delayUntils.push(now + (globalIdx * intervalMs));
 
