@@ -129,13 +129,6 @@ CREATE TABLE IF NOT EXISTS admin_restrictions (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Email open tracking columns
-ALTER TABLE email_queue ADD COLUMN IF NOT EXISTS opened_at TIMESTAMP;
-ALTER TABLE email_queue ADD COLUMN IF NOT EXISTS opened_count INTEGER DEFAULT 0;
-
--- Campaign open tracking column
-ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS opened_count INTEGER DEFAULT 0;
-
 -- Create indexes for performance
 CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id);
 CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
