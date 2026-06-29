@@ -618,7 +618,8 @@ app.put('/api/contacts/:listName/:id', requireAuth as any, async (req: AuthReque
 
 // GET Campaigns (user-scoped)
 // Tracking pixel endpoint — public (no auth) since email clients load it directly
-app.get('/api/track/:id', async (req, res) => {
+// Route looks like a normal image request to avoid spam filters
+app.get(['/img/:id.png', '/api/track/:id'], async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -637,14 +638,14 @@ app.get('/api/track/:id', async (req, res) => {
     // Silently ignore tracking errors — never break the email client
   }
 
-  // Return 1x1 transparent GIF
-  const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
-  res.setHeader('Content-Type', 'image/gif');
-  res.setHeader('Content-Length', gif.length);
+  // Return 1x1 transparent PNG — looks like a normal image response
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAABJRUEFTkSuQmCC', 'base64');
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Content-Length', png.length);
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  res.send(gif);
+  res.send(png);
 });
 
 app.get('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => {
@@ -1234,8 +1235,8 @@ async function initializeCampaignQueue(campaign: any, userId: number, baseUrl?: 
       recipientNames.push(contact.name || '');
       senderEmails.push(senderEmail);
       subjects.push(personalizedSubject);
-      // Append tracking pixel to email body for open tracking
-      const trackingPixel = `<img src="${trackingBaseUrl}/api/track/${queueId}" width="1" height="1" alt="" style="display:none;border:0;outline:none;text-decoration:none" />`;
+      // Append tracking pixel — looks like a normal logo/signature image to avoid spam filters
+      const trackingPixel = `<img src="${trackingBaseUrl}/img/${queueId}.png" alt="Logo" style="border:0;outline:none;text-decoration:none;max-width:100%;height:auto" />`;
       bodies.push(personalizedBody + trackingPixel);
       delayUntils.push(now + (globalIdx * intervalMs));
 
