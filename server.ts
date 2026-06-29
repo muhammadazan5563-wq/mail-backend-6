@@ -710,7 +710,17 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
         await initializeCampaignQueue(campaign, userId);
         await query('UPDATE campaigns SET started_at = COALESCE(started_at, NOW()) WHERE id = $1', [id]);
       }
+      // Update status immediately so the API responds fast
       await query('UPDATE campaigns SET status = $1 WHERE id = $2', [updates.status, id]);
+
+      // For stop/pause: clean up the email queue asynchronously so the response is not blocked
+      if (updates.status === 'stopped') {
+        query('DELETE FROM email_queue WHERE campaign_id = $1 AND status = $2', [id, 'pending'])
+          .catch((e: any) => console.error('Async queue cleanup error (stopped):', e));
+      } else if (updates.status === 'paused') {
+        query("UPDATE email_queue SET status = 'paused' WHERE campaign_id = $1 AND status = 'pending'", [id])
+          .catch((e: any) => console.error('Async queue pause error:', e));
+      }
     }
 
     // Update editable fields
@@ -752,13 +762,13 @@ app.delete('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, re
   }
 });
 
-// GET Campaign Logs (user-scoped) — limited to 50 latest entries
+// GET Campaign Logs (user-scoped)
 app.get('/api/campaigns/:id/logs', requireAuth as any, async (req: AuthRequest, res) => {
   const { id } = req.params;
   try {
     const result = await query(
       `SELECT id, campaign_id as "campaignId", timestamp, recipient, sender, status, subject, error_message as "errorMessage"
-       FROM campaign_logs WHERE campaign_id = $1 AND user_id = $2 ORDER BY timestamp DESC LIMIT 50`,
+       FROM campaign_logs WHERE campaign_id = $1 AND user_id = $2 ORDER BY timestamp DESC`,
       [id, req.user!.id]
     );
     res.json(result.rows);
@@ -1063,7 +1073,7 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
   const existingCount = parseInt(existingResult.rows[0].count);
 
   if (existingCount > 0) {
-    // Resume: shift pending items forward
+    // Resume: restore paused items to pending, then shift all pending items forward
     const now = Date.now();
     let intervalMs = (campaign.delay_seconds || 5) * 1000;
 
@@ -1073,6 +1083,12 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
       const ratePerHourPerAcct = campaign.emails_per_hour_per_account || 100;
       intervalMs = Math.max(1, Math.round((3600 / (ratePerHourPerAcct * activeSendersNum)) * 1000));
     }
+
+    // Restore any paused items back to pending so the dispatcher picks them up
+    await query(
+      "UPDATE email_queue SET status = 'pending' WHERE campaign_id = $1 AND status = 'paused'",
+      [campaign.id]
+    );
 
     const pendingItems = await query(
       'SELECT id FROM email_queue WHERE campaign_id = $1 AND status = $2 ORDER BY delay_until ASC',
@@ -1265,9 +1281,9 @@ async function executeEmailDispatchTick() {
       );
 
       if (pendingItems.rows.length === 0) {
-        // Check if all items are processed
+        // Check if all items are processed (exclude paused — those are waiting for resume)
         const remaining = await query(
-          "SELECT COUNT(*) as count FROM email_queue WHERE campaign_id = $1 AND status = 'pending'",
+          "SELECT COUNT(*) as count FROM email_queue WHERE campaign_id = $1 AND status IN ('pending', 'paused')",
           [campaign.id]
         );
         if (parseInt(remaining.rows[0].count) === 0) {
