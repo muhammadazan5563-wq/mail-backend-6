@@ -412,18 +412,58 @@ app.get('/api/auth/callback', async (req, res) => {
    USER DATA ROUTES (All scoped to authenticated user)
    ========================================================================== */
 
-// Get Connected Accounts (user-scoped)
+// Get Connected Accounts (user-scoped) — validates token health
 app.get('/api/accounts', requireAuth as any, async (req: AuthRequest, res) => {
   try {
     const result = await query(
-      'SELECT email, connected_at, status, CASE WHEN refresh_token IS NOT NULL THEN \'active\' ELSE \'expired\' END as computed_status FROM accounts WHERE user_id = $1 ORDER BY connected_at DESC',
+      'SELECT id, email, connected_at, status, access_token, refresh_token, expires_at FROM accounts WHERE user_id = $1 ORDER BY connected_at DESC',
       [req.user!.id]
     );
-    const safeAccounts = result.rows.map(a => ({
-      email: a.email,
-      connectedAt: a.connected_at,
-      status: a.computed_status
+
+    // Validate each account's token health in parallel
+    const safeAccounts = await Promise.all(result.rows.map(async (a) => {
+      let computedStatus: 'active' | 'expired' = 'expired';
+
+      if (!a.refresh_token) {
+        // No refresh token means definitely expired
+        computedStatus = 'expired';
+      } else {
+        // Check if the current access token is still valid
+        const isTokenExpired = !a.expires_at || a.expires_at <= Date.now() + 60 * 1000;
+
+        if (!isTokenExpired && a.access_token) {
+          // Token not expired yet, consider active
+          computedStatus = 'active';
+        } else {
+          // Token expired or missing — try to refresh to verify the refresh_token is still valid
+          try {
+            const refreshResult = await refreshGoogleToken(a.refresh_token);
+            // Refresh succeeded — update the stored token
+            const newExpiresAt = Date.now() + refreshResult.expiresIn * 1000;
+            await query(
+              'UPDATE accounts SET access_token = $1, expires_at = $2, status = $3 WHERE id = $4',
+              [refreshResult.accessToken, newExpiresAt, 'active', a.id]
+            );
+            computedStatus = 'active';
+          } catch (refreshErr: any) {
+            // Refresh failed — token is revoked or invalid
+            console.error(`Token validation failed for ${a.email}:`, refreshErr.message);
+            await query(
+              "UPDATE accounts SET status = 'expired' WHERE id = $1",
+              [a.id]
+            );
+            computedStatus = 'expired';
+          }
+        }
+      }
+
+      return {
+        email: a.email,
+        connectedAt: a.connected_at,
+        status: computedStatus
+      };
     }));
+
     res.json(safeAccounts);
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to fetch accounts.' });
