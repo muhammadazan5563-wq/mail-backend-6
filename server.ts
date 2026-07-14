@@ -1041,32 +1041,28 @@ app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, re
       return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: 'Domain does not exist', domain, selected: false };
     }
 
-    // SMTP RCPT TO verification for all domains
+    // SMTP RCPT TO verification
     // Sort MX records by priority (lowest = highest priority)
     const sortedMx = mxRecords.sort((a, b) => a.priority - b.priority);
     const mxHost = sortedMx[0].exchange;
     const isCatchAll = CATCH_ALL_DOMAINS.includes(domain);
 
+    // For catch-all providers (Gmail, Outlook, etc.), skip SMTP since they block port 25
+    // and always accept RCPT TO anyway — MX verification is the best possible check
+    if (isCatchAll) {
+      return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'MX verified (provider does not support SMTP recipient check)', domain, selected: true };
+    }
+
+    // For other domains, perform full SMTP RCPT TO verification
     try {
       const smtpResult = await smtpVerifyEmail(email, mxHost, 10000);
       if (smtpResult.valid) {
-        if (isCatchAll) {
-          // Catch-all providers accept all RCPT TO — SMTP accepted but can't guarantee mailbox exists
-          return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'SMTP accepted (catch-all provider — mailbox unverifiable)', domain, selected: true };
-        }
         return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: smtpResult.reason, domain, selected: true };
       } else {
-        if (isCatchAll) {
-          // If a catch-all provider rejects, the mailbox definitely doesn't exist
-          return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: smtpResult.reason, domain, selected: false };
-        }
         return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: smtpResult.reason, domain, selected: false };
       }
     } catch (smtpErr: any) {
       // If SMTP check fails entirely (firewall, port blocked), fall back to MX-only validation
-      if (isCatchAll) {
-        return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'MX verified (SMTP connection blocked by provider)', domain, selected: true };
-      }
       return { id: Math.random().toString(36).substr(2, 9), email, status: 'risky', reason: 'MX valid but SMTP verification unavailable', domain, selected: true };
     }
   };
