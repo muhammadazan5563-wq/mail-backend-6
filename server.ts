@@ -884,6 +884,118 @@ const DISPOSABLE = [
   'trashmail.com', 'getairmail.com', 'temp-mail.com', 'tempmail.net'
 ];
 
+// SMTP verification helper — connects to MX server and checks RCPT TO
+const smtpVerifyEmail = (email: string, mxHost: string, timeoutMs: number = 10000): Promise<{ valid: boolean; reason: string }> => {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let step = 0;
+    let response = '';
+    let resolved = false;
+
+    const finish = (valid: boolean, reason: string) => {
+      if (resolved) return;
+      resolved = true;
+      try {
+        socket.write('QUIT\r\n');
+        socket.end();
+        socket.destroy();
+      } catch (e) { /* ignore */ }
+      resolve({ valid, reason });
+    };
+
+    const timer = setTimeout(() => {
+      finish(false, 'SMTP connection timeout');
+    }, timeoutMs);
+
+    socket.on('error', (err: any) => {
+      clearTimeout(timer);
+      // Connection refused or network error — can't verify, treat as risky
+      finish(false, `SMTP connection failed: ${err.code || err.message}`);
+    });
+
+    socket.on('close', () => {
+      clearTimeout(timer);
+      if (!resolved) {
+        finish(false, 'SMTP connection closed unexpectedly');
+      }
+    });
+
+    socket.on('data', (data: Buffer) => {
+      response += data.toString();
+
+      // Process line-by-line once we have a complete response (ends with \r\n)
+      if (!response.includes('\r\n') && !response.includes('\n')) return;
+
+      const code = parseInt(response.substring(0, 3));
+
+      if (step === 0) {
+        // Server greeting
+        if (code === 220) {
+          step = 1;
+          response = '';
+          socket.write('EHLO equinoxmail.verify\r\n');
+        } else {
+          finish(false, `SMTP server rejected connection (${code})`);
+        }
+      } else if (step === 1) {
+        // EHLO response (may be multi-line, wait for final line without dash)
+        const lines = response.split(/\r?\n/).filter(l => l.length > 0);
+        const lastLine = lines[lines.length - 1];
+        // Multi-line responses have dash after code (e.g., "250-SIZE"), final line has space (e.g., "250 OK")
+        if (lastLine && lastLine.length >= 4 && lastLine[3] !== '-') {
+          const ehloCode = parseInt(lastLine.substring(0, 3));
+          if (ehloCode === 250) {
+            step = 2;
+            response = '';
+            socket.write(`MAIL FROM:<verify@equinoxmail.app>\r\n`);
+          } else {
+            finish(false, `EHLO rejected (${ehloCode})`);
+          }
+        }
+      } else if (step === 2) {
+        // MAIL FROM response
+        if (code === 250) {
+          step = 3;
+          response = '';
+          socket.write(`RCPT TO:<${email}>\r\n`);
+        } else {
+          finish(false, `MAIL FROM rejected (${code})`);
+        }
+      } else if (step === 3) {
+        // RCPT TO response — this is the key check
+        if (code === 250 || code === 251) {
+          clearTimeout(timer);
+          finish(true, 'SMTP mailbox verified (RCPT TO accepted)');
+        } else if (code === 550 || code === 551 || code === 552 || code === 553 || code === 554) {
+          clearTimeout(timer);
+          finish(false, `Mailbox does not exist (SMTP ${code})`);
+        } else if (code === 450 || code === 451 || code === 452) {
+          // Temporary failure — mailbox might exist but server is busy/greylisting
+          clearTimeout(timer);
+          finish(true, `SMTP temporary response (${code}) — mailbox likely exists`);
+        } else {
+          clearTimeout(timer);
+          finish(false, `RCPT TO rejected (SMTP ${code})`);
+        }
+      }
+    });
+
+    try {
+      socket.connect(25, mxHost);
+    } catch (err: any) {
+      clearTimeout(timer);
+      finish(false, `Failed to connect to SMTP: ${err.message}`);
+    }
+  });
+};
+
+// Domains known to block SMTP verification (catch-all or always accept RCPT TO)
+const CATCH_ALL_DOMAINS = [
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'outlook.com',
+  'hotmail.com', 'live.com', 'msn.com', 'icloud.com', 'me.com', 'mac.com',
+  'aol.com', 'protonmail.com', 'proton.me', 'zoho.com'
+];
+
 // POST /api/validate-emails (requires auth)
 app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, res) => {
   const { emails } = req.body;
@@ -891,7 +1003,11 @@ app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, re
     return res.status(400).json({ error: 'Expected "emails" parameter to be an array of strings' });
   }
 
-  const promises = emails.map(async (rawEmail: string) => {
+  // Process in controlled concurrency to avoid overwhelming SMTP servers
+  const CONCURRENCY = 5;
+  const results: any[] = new Array(emails.length);
+
+  const validateSingle = async (rawEmail: string, index: number) => {
     const email = (rawEmail || '').trim();
     if (!email) {
       return { id: Math.random().toString(36).substr(2, 9), email: '', status: 'invalid', reason: 'Empty row', domain: '', selected: false };
@@ -914,18 +1030,51 @@ app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, re
     }
 
     // DNS MX check
+    let mxRecords: dns.MxRecord[];
     try {
-      const mxRecords = await dns.promises.resolveMx(domain);
+      mxRecords = await dns.promises.resolveMx(domain);
       if (!mxRecords || mxRecords.length === 0) {
         return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: 'No MX records found', domain, selected: false };
       }
-      return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'MX records verified', domain, selected: true };
     } catch (err) {
       return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: 'Domain does not exist', domain, selected: false };
     }
-  });
 
-  const results = await Promise.all(promises);
+    // For major providers that use catch-all or block SMTP verification,
+    // MX verification is the best we can do — mark as valid with note
+    if (CATCH_ALL_DOMAINS.includes(domain)) {
+      return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'MX verified (major provider — SMTP check skipped)', domain, selected: true };
+    }
+
+    // SMTP RCPT TO verification for other domains
+    // Sort MX records by priority (lowest = highest priority)
+    const sortedMx = mxRecords.sort((a, b) => a.priority - b.priority);
+    const mxHost = sortedMx[0].exchange;
+
+    try {
+      const smtpResult = await smtpVerifyEmail(email, mxHost, 10000);
+      if (smtpResult.valid) {
+        return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: smtpResult.reason, domain, selected: true };
+      } else {
+        return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: smtpResult.reason, domain, selected: false };
+      }
+    } catch (smtpErr: any) {
+      // If SMTP check fails entirely (firewall, port blocked), fall back to MX-only validation
+      return { id: Math.random().toString(36).substr(2, 9), email, status: 'risky', reason: 'MX valid but SMTP verification unavailable', domain, selected: true };
+    }
+  };
+
+  // Process with controlled concurrency
+  for (let i = 0; i < emails.length; i += CONCURRENCY) {
+    const batch = emails.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map((email, batchIdx) => validateSingle(email, i + batchIdx))
+    );
+    batchResults.forEach((result, batchIdx) => {
+      results[i + batchIdx] = result;
+    });
+  }
+
   res.json(results);
 });
 
