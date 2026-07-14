@@ -989,7 +989,8 @@ const smtpVerifyEmail = (email: string, mxHost: string, timeoutMs: number = 1000
   });
 };
 
-// Domains known to block SMTP verification (catch-all or always accept RCPT TO)
+// Domains known to use catch-all (accept all RCPT TO regardless of mailbox existence)
+// For these, SMTP check will still be attempted but a positive result is noted as "catch-all"
 const CATCH_ALL_DOMAINS = [
   'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'outlook.com',
   'hotmail.com', 'live.com', 'msn.com', 'icloud.com', 'me.com', 'mac.com',
@@ -1040,26 +1041,32 @@ app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, re
       return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: 'Domain does not exist', domain, selected: false };
     }
 
-    // For major providers that use catch-all or block SMTP verification,
-    // MX verification is the best we can do — mark as valid with note
-    if (CATCH_ALL_DOMAINS.includes(domain)) {
-      return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'MX verified (major provider — SMTP check skipped)', domain, selected: true };
-    }
-
-    // SMTP RCPT TO verification for other domains
+    // SMTP RCPT TO verification for all domains
     // Sort MX records by priority (lowest = highest priority)
     const sortedMx = mxRecords.sort((a, b) => a.priority - b.priority);
     const mxHost = sortedMx[0].exchange;
+    const isCatchAll = CATCH_ALL_DOMAINS.includes(domain);
 
     try {
       const smtpResult = await smtpVerifyEmail(email, mxHost, 10000);
       if (smtpResult.valid) {
+        if (isCatchAll) {
+          // Catch-all providers accept all RCPT TO — SMTP accepted but can't guarantee mailbox exists
+          return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'SMTP accepted (catch-all provider — mailbox unverifiable)', domain, selected: true };
+        }
         return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: smtpResult.reason, domain, selected: true };
       } else {
+        if (isCatchAll) {
+          // If a catch-all provider rejects, the mailbox definitely doesn't exist
+          return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: smtpResult.reason, domain, selected: false };
+        }
         return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: smtpResult.reason, domain, selected: false };
       }
     } catch (smtpErr: any) {
       // If SMTP check fails entirely (firewall, port blocked), fall back to MX-only validation
+      if (isCatchAll) {
+        return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'MX verified (SMTP connection blocked by provider)', domain, selected: true };
+      }
       return { id: Math.random().toString(36).substr(2, 9), email, status: 'risky', reason: 'MX valid but SMTP verification unavailable', domain, selected: true };
     }
   };
