@@ -884,118 +884,388 @@ const DISPOSABLE = [
   'trashmail.com', 'getairmail.com', 'temp-mail.com', 'tempmail.net'
 ];
 
-// SMTP verification helper — connects to MX server and checks RCPT TO
-const smtpVerifyEmail = (email: string, mxHost: string, timeoutMs: number = 10000): Promise<{ valid: boolean; reason: string }> => {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    let step = 0;
-    let response = '';
-    let resolved = false;
+/* --------------------------------------------------------------------------
+   SMTP mailbox verification (real RCPT TO probe)
 
-    const finish = (valid: boolean, reason: string) => {
-      if (resolved) return;
-      resolved = true;
-      try {
-        socket.write('QUIT\r\n');
-        socket.end();
-        socket.destroy();
-      } catch (e) { /* ignore */ }
-      resolve({ valid, reason });
+   Previous behaviour marked every gmail.com / outlook.com address as "valid"
+   after a plain MX lookup. That is wrong: an MX record only proves the DOMAIN
+   can receive mail, never that the MAILBOX exists. Gmail and Outlook do answer
+   RCPT TO honestly (550 5.1.1 for unknown users), so we now always probe the
+   mailbox and only report "valid" when the receiving server accepted it.
+   -------------------------------------------------------------------------- */
+
+const SMTP_PORT = 25;
+const SMTP_TIMEOUT_MS = Number(process.env.SMTP_VERIFY_TIMEOUT_MS || 8000);
+const SMTP_EHLO_HOST = process.env.SMTP_VERIFY_EHLO_HOST || 'mail.equinoxmail.app';
+const SMTP_FROM_EMAIL = process.env.SMTP_VERIFY_FROM_EMAIL || 'verify@equinoxmail.app';
+const SMTP_PROBE_HOST = process.env.SMTP_VERIFY_PROBE_HOST || 'gmail-smtp-in.l.google.com';
+
+interface SmtpReply {
+  code: number;
+  text: string;
+}
+
+type MailboxOutcome = 'valid' | 'invalid' | 'catchall' | 'unknown';
+
+// Reply fragments that specifically mean "this mailbox does not exist".
+const MAILBOX_UNKNOWN_PATTERNS = [
+  '5.1.1', '5.1.0', '5.1.2', '5.1.3', '5.1.6', '5.2.1',
+  'user unknown', 'unknown user', 'no such user', 'no such recipient',
+  'recipient not found', 'recipient address rejected', 'address not found',
+  'does not exist', "doesn't exist", 'invalid recipient', 'unknown recipient',
+  'mailbox not found', 'mailbox unavailable', 'user not found', 'no mailbox',
+  'account does not exist', 'not a valid mailbox', 'unrouteable address',
+  'address rejected', 'invalid mailbox', 'unknown address'
+];
+
+// Reply fragments meaning "our probe was refused" — says nothing about the mailbox.
+const POLICY_BLOCK_PATTERNS = [
+  '5.7.0', '5.7.1', '5.7.25', '5.7.26', '5.7.606', '5.7.708',
+  'spam', 'blocked', 'blacklist', 'block list', 'blocklist', 'policy',
+  'reputation', 'not authorized', 'not authorised', 'access denied', 'banned',
+  'rbl', 'dnsbl', 'rate limit', 'too many', 'try again later', 'greylist',
+  'grey-listed', 'temporarily deferred', 'unsolicited', 'refused'
+];
+
+// Providers that reliably reject unknown mailboxes, so no catch-all probe is needed.
+const STRICT_PROVIDER_DOMAINS = [
+  'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'hotmail.co.uk',
+  'live.com', 'live.co.uk', 'msn.com', 'yahoo.com', 'yahoo.co.uk', 'ymail.com',
+  'icloud.com', 'me.com', 'mac.com', 'aol.com', 'protonmail.com', 'proton.me',
+  'zoho.com', 'gmx.com', 'gmx.de', 'mail.com', 'yandex.com', 'yandex.ru'
+];
+
+const ROLE_PREFIXES = [
+  'admin', 'support', 'sales', 'info', 'contact', 'jobs', 'careers', 'billing',
+  'team', 'hello', 'marketing', 'press', 'office', 'help', 'service', 'staff',
+  'hr', 'media', 'enquiry', 'enquiries', 'noreply', 'no-reply', 'postmaster',
+  'webmaster', 'abuse'
+];
+
+const makeResult = (
+  email: string,
+  status: 'valid' | 'invalid' | 'risky',
+  reason: string,
+  domain: string,
+  selected: boolean
+) => ({
+  id: Math.random().toString(36).substr(2, 9),
+  email,
+  status,
+  reason,
+  domain,
+  selected
+});
+
+interface SmtpSession {
+  greeting: SmtpReply;
+  send: (cmd: string | null) => Promise<SmtpReply>;
+  close: () => void;
+}
+
+// Opens an SMTP session and resolves once the server banner has been read.
+const openSmtpSession = (host: string, timeoutMs: number = SMTP_TIMEOUT_MS): Promise<SmtpSession> => {
+  return new Promise<SmtpSession>((resolve, reject) => {
+    const socket = new net.Socket();
+    let buffer = '';
+    let settled = false;
+    let pending: { resolve: (reply: SmtpReply) => void; reject: (err: Error) => void } | null = null;
+
+    // A reply is complete only when the buffer ends with a newline AND the last
+    // line uses a space (or nothing) after the 3-digit code. Multi-line replies
+    // use "250-..." for every line except the final "250 ..." line.
+    const isComplete = (buf: string) => {
+      if (!/\r?\n$/.test(buf)) return false;
+      const lines = buf.split(/\r?\n/).filter(l => l.length > 0);
+      if (lines.length === 0) return false;
+      return /^\d{3}(?: |$)/.test(lines[lines.length - 1]);
     };
 
-    const timer = setTimeout(() => {
-      finish(false, 'SMTP connection timeout');
-    }, timeoutMs);
+    const flush = () => {
+      if (!pending || !isComplete(buffer)) return;
+      const lines = buffer.split(/\r?\n/).filter(l => l.length > 0);
+      const code = parseInt(lines[lines.length - 1].substring(0, 3), 10);
+      const text = lines.join(' ');
+      buffer = '';
+      const waiting = pending;
+      pending = null;
+      waiting.resolve({ code: Number.isNaN(code) ? 0 : code, text });
+    };
 
-    socket.on('error', (err: any) => {
-      clearTimeout(timer);
-      // Connection refused or network error — can't verify, treat as risky
-      finish(false, `SMTP connection failed: ${err.code || err.message}`);
-    });
-
-    socket.on('close', () => {
-      clearTimeout(timer);
-      if (!resolved) {
-        finish(false, 'SMTP connection closed unexpectedly');
+    const failAll = (err: Error) => {
+      if (pending) {
+        const waiting = pending;
+        pending = null;
+        waiting.reject(err);
       }
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+      try { socket.destroy(); } catch (e) { /* ignore */ }
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => {
+      const err: any = new Error('SMTP timeout');
+      err.code = 'ETIMEDOUT';
+      failAll(err);
+    });
+    socket.on('error', (err: any) => failAll(err));
+    socket.on('close', () => failAll(new Error('SMTP connection closed')));
+    socket.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      flush();
     });
 
-    socket.on('data', (data: Buffer) => {
-      response += data.toString();
-
-      // Process line-by-line once we have a complete response (ends with \r\n)
-      if (!response.includes('\r\n') && !response.includes('\n')) return;
-
-      const code = parseInt(response.substring(0, 3));
-
-      if (step === 0) {
-        // Server greeting
-        if (code === 220) {
-          step = 1;
-          response = '';
-          socket.write('EHLO equinoxmail.verify\r\n');
-        } else {
-          finish(false, `SMTP server rejected connection (${code})`);
-        }
-      } else if (step === 1) {
-        // EHLO response (may be multi-line, wait for final line without dash)
-        const lines = response.split(/\r?\n/).filter(l => l.length > 0);
-        const lastLine = lines[lines.length - 1];
-        // Multi-line responses have dash after code (e.g., "250-SIZE"), final line has space (e.g., "250 OK")
-        if (lastLine && lastLine.length >= 4 && lastLine[3] !== '-') {
-          const ehloCode = parseInt(lastLine.substring(0, 3));
-          if (ehloCode === 250) {
-            step = 2;
-            response = '';
-            socket.write(`MAIL FROM:<verify@equinoxmail.app>\r\n`);
-          } else {
-            finish(false, `EHLO rejected (${ehloCode})`);
+    // Passing null waits for an unsolicited reply (the initial banner).
+    const send = (cmd: string | null) =>
+      new Promise<SmtpReply>((res, rej) => {
+        pending = { resolve: res, reject: rej };
+        if (cmd !== null) {
+          try {
+            socket.write(cmd + '\r\n');
+          } catch (err: any) {
+            pending = null;
+            rej(err);
+            return;
           }
         }
-      } else if (step === 2) {
-        // MAIL FROM response
-        if (code === 250) {
-          step = 3;
-          response = '';
-          socket.write(`RCPT TO:<${email}>\r\n`);
-        } else {
-          finish(false, `MAIL FROM rejected (${code})`);
-        }
-      } else if (step === 3) {
-        // RCPT TO response — this is the key check
-        if (code === 250 || code === 251) {
-          clearTimeout(timer);
-          finish(true, 'SMTP mailbox verified (RCPT TO accepted)');
-        } else if (code === 550 || code === 551 || code === 552 || code === 553 || code === 554) {
-          clearTimeout(timer);
-          finish(false, `Mailbox does not exist (SMTP ${code})`);
-        } else if (code === 450 || code === 451 || code === 452) {
-          // Temporary failure — mailbox might exist but server is busy/greylisting
-          clearTimeout(timer);
-          finish(true, `SMTP temporary response (${code}) — mailbox likely exists`);
-        } else {
-          clearTimeout(timer);
-          finish(false, `RCPT TO rejected (SMTP ${code})`);
-        }
-      }
-    });
+        flush();
+      });
 
-    try {
-      socket.connect(25, mxHost);
-    } catch (err: any) {
-      clearTimeout(timer);
-      finish(false, `Failed to connect to SMTP: ${err.message}`);
-    }
+    socket.connect(SMTP_PORT, host, () => {
+      send(null)
+        .then((greeting) => {
+          settled = true;
+          resolve({
+            greeting,
+            send,
+            close: () => {
+              try {
+                socket.write('QUIT\r\n');
+                socket.end();
+                socket.destroy();
+              } catch (e) { /* ignore */ }
+            }
+          });
+        })
+        .catch((err: Error) => failAll(err));
+    });
   });
 };
 
-// Domains known to use catch-all (accept all RCPT TO regardless of mailbox existence)
-// For these, SMTP check will still be attempted but a positive result is noted as "catch-all"
-const CATCH_ALL_DOMAINS = [
-  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'outlook.com',
-  'hotmail.com', 'live.com', 'msn.com', 'icloud.com', 'me.com', 'mac.com',
-  'aol.com', 'protonmail.com', 'proton.me', 'zoho.com'
-];
+// Turns an RCPT TO reply into a verdict about the mailbox.
+const classifyRcptReply = (reply: SmtpReply): MailboxOutcome => {
+  const text = (reply.text || '').toLowerCase();
+  const looksUnknown = MAILBOX_UNKNOWN_PATTERNS.some(p => text.includes(p));
+  const looksBlocked = POLICY_BLOCK_PATTERNS.some(p => text.includes(p));
+
+  if (reply.code >= 200 && reply.code < 300) return 'valid';
+  // 4xx = temporary (greylisting, rate limits) — the mailbox is simply unconfirmed.
+  if (reply.code >= 400 && reply.code < 500) return 'unknown';
+
+  if (reply.code >= 500) {
+    if (looksUnknown) return 'invalid';
+    // A 5xx that is clearly about our sending IP/policy tells us nothing.
+    if (looksBlocked) return 'unknown';
+    if (reply.code === 550 || reply.code === 551 || reply.code === 553) return 'invalid';
+    return 'unknown';
+  }
+  return 'unknown';
+};
+
+const shortReply = (reply: SmtpReply) => {
+  const text = (reply.text || '').replace(/\s+/g, ' ').trim();
+  return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+};
+
+// Runs the full MAIL FROM / RCPT TO conversation against the domain's MX hosts.
+const verifyMailbox = async (
+  email: string,
+  domain: string,
+  mxHosts: string[]
+): Promise<{ outcome: MailboxOutcome; reason: string }> => {
+  let lastReason = 'Mailbox check did not complete';
+
+  for (const host of mxHosts.slice(0, 2)) {
+    let session: SmtpSession;
+    try {
+      session = await openSmtpSession(host);
+    } catch (err: any) {
+      lastReason = `Could not reach mail server ${host} on port 25 (${err.code || err.message})`;
+      continue;
+    }
+
+    try {
+      if (session.greeting.code !== 220) {
+        lastReason = `Mail server ${host} refused the connection (${session.greeting.code})`;
+        session.close();
+        continue;
+      }
+
+      let handshake = await session.send(`EHLO ${SMTP_EHLO_HOST}`);
+      if (handshake.code !== 250) {
+        handshake = await session.send(`HELO ${SMTP_EHLO_HOST}`);
+      }
+      if (handshake.code !== 250) {
+        lastReason = `Mail server ${host} rejected the handshake (${handshake.code})`;
+        session.close();
+        continue;
+      }
+
+      let mailFrom = await session.send(`MAIL FROM:<${SMTP_FROM_EMAIL}>`);
+      if (mailFrom.code !== 250) {
+        // Some servers only accept the null sender for verification probes.
+        mailFrom = await session.send('MAIL FROM:<>');
+      }
+      if (mailFrom.code !== 250) {
+        lastReason = `Mail server ${host} rejected the probe sender (${mailFrom.code})`;
+        session.close();
+        continue;
+      }
+
+      const rcpt = await session.send(`RCPT TO:<${email}>`);
+      const verdict = classifyRcptReply(rcpt);
+
+      if (verdict === 'invalid') {
+        session.close();
+        return {
+          outcome: 'invalid',
+          reason: `Mailbox rejected by ${domain} mail server — ${shortReply(rcpt)}`
+        };
+      }
+
+      if (verdict !== 'valid') {
+        lastReason = `Mail server ${host} gave no usable answer — ${shortReply(rcpt)}`;
+        session.close();
+        continue;
+      }
+
+      // Accepted. Strict providers never accept unknown users, so trust it.
+      if (STRICT_PROVIDER_DOMAINS.includes(domain)) {
+        session.close();
+        return {
+          outcome: 'valid',
+          reason: `Mailbox confirmed by ${domain} mail server (RCPT TO accepted)`
+        };
+      }
+
+      // Otherwise probe a random address to detect a catch-all domain.
+      const probeLocal = `no-such-user-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const probe = await session.send(`RCPT TO:<${probeLocal}@${domain}>`);
+      session.close();
+
+      if (classifyRcptReply(probe) === 'valid') {
+        return {
+          outcome: 'catchall',
+          reason: `${domain} accepts every address (catch-all) — mailbox existence cannot be confirmed`
+        };
+      }
+
+      return {
+        outcome: 'valid',
+        reason: `Mailbox confirmed by ${domain} mail server (RCPT TO accepted)`
+      };
+    } catch (err: any) {
+      lastReason = `Mailbox check failed on ${host} (${err.code || err.message})`;
+      try { session.close(); } catch (e) { /* ignore */ }
+      continue;
+    }
+  }
+
+  return { outcome: 'unknown', reason: lastReason };
+};
+
+/* --------------------------------------------------------------------------
+   Outbound port 25 reachability (cached)
+
+   Most PaaS providers (Railway, Vercel, Heroku, ...) block outbound port 25.
+   We detect that once instead of timing out on every single address, and we
+   report the affected addresses as "risky" rather than pretending they exist.
+   -------------------------------------------------------------------------- */
+
+const OUTBOUND_CACHE_MS = 10 * 60 * 1000;
+let outboundSmtpState: { ok: boolean; detail: string; checkedAt: number } | null = null;
+let outboundSmtpInFlight: Promise<{ ok: boolean; detail: string; checkedAt: number }> | null = null;
+
+const probeOutboundSmtp = (): Promise<{ ok: boolean; detail: string }> => {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let done = false;
+    const finish = (ok: boolean, detail: string) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch (e) { /* ignore */ }
+      resolve({ ok, detail });
+    };
+
+    socket.setTimeout(6000);
+    socket.on('timeout', () => finish(false, 'outbound SMTP port 25 is blocked on this host (connection timed out)'));
+    socket.on('error', (err: any) => finish(false, `outbound SMTP port 25 is unavailable on this host (${err.code || err.message})`));
+    socket.on('data', () => finish(true, 'outbound SMTP port 25 is reachable'));
+    socket.connect(SMTP_PORT, SMTP_PROBE_HOST);
+  });
+};
+
+const checkOutboundSmtp = async (force = false) => {
+  if (!force && outboundSmtpState && Date.now() - outboundSmtpState.checkedAt < OUTBOUND_CACHE_MS) {
+    return outboundSmtpState;
+  }
+  if (!force && outboundSmtpInFlight) return outboundSmtpInFlight;
+
+  outboundSmtpInFlight = probeOutboundSmtp()
+    .then((state) => {
+      outboundSmtpState = { ...state, checkedAt: Date.now() };
+      return outboundSmtpState;
+    })
+    .finally(() => {
+      outboundSmtpInFlight = null;
+    });
+
+  return outboundSmtpInFlight;
+};
+
+// MX lookups are cached briefly so large lists don't re-resolve the same domain.
+const MX_CACHE_MS = 5 * 60 * 1000;
+const mxCache = new Map<string, { hosts: string[]; at: number }>();
+
+const resolveMxHosts = async (domain: string): Promise<string[]> => {
+  const cached = mxCache.get(domain);
+  if (cached && Date.now() - cached.at < MX_CACHE_MS) return cached.hosts;
+
+  const records = await dns.promises.resolveMx(domain);
+  const hosts = (records || [])
+    .slice()
+    .sort((a, b) => a.priority - b.priority)
+    .map(r => r.exchange)
+    .filter(Boolean);
+
+  mxCache.set(domain, { hosts, at: Date.now() });
+  return hosts;
+};
+
+// Provider-specific local-part rules that can rule an address out without SMTP.
+const checkProviderLocalPart = (localPart: string, domain: string): string | null => {
+  if (domain !== 'gmail.com' && domain !== 'googlemail.com') return null;
+
+  const base = localPart.split('+')[0].toLowerCase();
+  const compact = base.replace(/\./g, '');
+
+  if (!/^[a-z0-9.]+$/.test(base)) {
+    return 'Gmail usernames may only contain letters, numbers and dots';
+  }
+  if (base.startsWith('.') || base.endsWith('.') || base.includes('..')) {
+    return 'Gmail usernames cannot start/end with a dot or contain consecutive dots';
+  }
+  if (compact.length < 6) {
+    return 'Gmail usernames must be at least 6 characters long';
+  }
+  if (compact.length > 30) {
+    return 'Gmail usernames cannot be longer than 30 characters';
+  }
+  return null;
+};
 
 // POST /api/validate-emails (requires auth)
 app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, res) => {
@@ -1030,41 +1300,68 @@ app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, re
       return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: 'Disposable/temporary domain', domain, selected: false };
     }
 
-    // DNS MX check
-    let mxRecords: dns.MxRecord[];
+    const localPart = parts[0];
+
+    // Provider-specific username rules (catches malformed Gmail addresses early)
+    const localPartIssue = checkProviderLocalPart(localPart, domain);
+    if (localPartIssue) {
+      return makeResult(email, 'invalid', localPartIssue, domain, false);
+    }
+
+    // DNS MX check — proves the DOMAIN can receive mail, not that the mailbox exists
+    let mxHosts: string[];
     try {
-      mxRecords = await dns.promises.resolveMx(domain);
-      if (!mxRecords || mxRecords.length === 0) {
-        return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: 'No MX records found', domain, selected: false };
-      }
+      mxHosts = await resolveMxHosts(domain);
     } catch (err) {
-      return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: 'Domain does not exist', domain, selected: false };
+      return makeResult(email, 'invalid', 'Domain does not exist (DNS lookup failed)', domain, false);
+    }
+    if (!mxHosts || mxHosts.length === 0) {
+      return makeResult(email, 'invalid', 'No MX records found — this domain cannot receive mail', domain, false);
     }
 
-    // SMTP RCPT TO verification
-    // Sort MX records by priority (lowest = highest priority)
-    const sortedMx = mxRecords.sort((a, b) => a.priority - b.priority);
-    const mxHost = sortedMx[0].exchange;
-    const isCatchAll = CATCH_ALL_DOMAINS.includes(domain);
-
-    // For catch-all providers (Gmail, Outlook, etc.), skip SMTP since they block port 25
-    // and always accept RCPT TO anyway — MX verification is the best possible check
-    if (isCatchAll) {
-      return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: 'MX verified (provider does not support SMTP recipient check)', domain, selected: true };
+    // If the host blocks outbound port 25 we cannot confirm any mailbox.
+    // Report that honestly as "risky" instead of claiming the address is valid.
+    const outbound = await checkOutboundSmtp();
+    if (!outbound.ok) {
+      return makeResult(
+        email,
+        'risky',
+        `Domain accepts mail, but the mailbox could not be verified — ${outbound.detail}`,
+        domain,
+        false
+      );
     }
 
-    // For other domains, perform full SMTP RCPT TO verification
+    // Real SMTP RCPT TO verification for every domain, Gmail/Outlook included
+    let verdict: { outcome: MailboxOutcome; reason: string };
     try {
-      const smtpResult = await smtpVerifyEmail(email, mxHost, 10000);
-      if (smtpResult.valid) {
-        return { id: Math.random().toString(36).substr(2, 9), email, status: 'valid', reason: smtpResult.reason, domain, selected: true };
-      } else {
-        return { id: Math.random().toString(36).substr(2, 9), email, status: 'invalid', reason: smtpResult.reason, domain, selected: false };
-      }
+      verdict = await verifyMailbox(email, domain, mxHosts);
     } catch (smtpErr: any) {
-      // If SMTP check fails entirely (firewall, port blocked), fall back to MX-only validation
-      return { id: Math.random().toString(36).substr(2, 9), email, status: 'risky', reason: 'MX valid but SMTP verification unavailable', domain, selected: true };
+      return makeResult(
+        email,
+        'risky',
+        `Domain accepts mail, but the mailbox check failed (${smtpErr.code || smtpErr.message})`,
+        domain,
+        false
+      );
     }
+
+    if (verdict.outcome === 'invalid') {
+      return makeResult(email, 'invalid', verdict.reason, domain, false);
+    }
+
+    if (verdict.outcome === 'catchall') {
+      return makeResult(email, 'risky', verdict.reason, domain, true);
+    }
+
+    if (verdict.outcome === 'valid') {
+      const roleNote = ROLE_PREFIXES.includes(localPart.toLowerCase())
+        ? ' — role-based address, not a personal inbox'
+        : '';
+      return makeResult(email, 'valid', verdict.reason + roleNote, domain, true);
+    }
+
+    return makeResult(email, 'risky', verdict.reason, domain, false);
   };
 
   // Process with controlled concurrency
@@ -1079,6 +1376,23 @@ app.post('/api/validate-emails', requireAuth as any, async (req: AuthRequest, re
   }
 
   res.json(results);
+});
+
+// GET /api/validate-emails/health — reports whether real mailbox checks are possible
+app.get('/api/validate-emails/health', requireAuth as any, async (_req: AuthRequest, res) => {
+  try {
+    const outbound = await checkOutboundSmtp(true);
+    res.json({
+      smtpReachable: outbound.ok,
+      detail: outbound.detail,
+      probeHost: SMTP_PROBE_HOST,
+      ehloHost: SMTP_EHLO_HOST,
+      probeSender: SMTP_FROM_EMAIL,
+      timeoutMs: SMTP_TIMEOUT_MS
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to probe outbound SMTP' });
+  }
 });
 
 /* ==========================================================================
