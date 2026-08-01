@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import dns from 'dns';
 import net from 'net';
+import https from 'https';
 import dotenv from 'dotenv';
 import { query } from './db.js';
 import {
@@ -1265,6 +1266,271 @@ const checkProviderLocalPart = (localPart: string, domain: string): string | nul
     return 'Gmail usernames cannot be longer than 30 characters';
   }
   return null;
+};
+
+/* --------------------------------------------------------------------------
+   HTTPS mailbox verification (Railway-compatible)
+
+   Railway — like Vercel, Heroku and Render — permanently blocks outbound TCP
+   port 25, so a direct RCPT TO probe can never run there. That is an anti-spam
+   policy on the provider network and cannot be bypassed in code.
+
+   Real mailbox verification is still possible over plain HTTPS (port 443) by
+   delegating the SMTP handshake to a verification provider. Set these two
+   environment variables in the Railway dashboard:
+
+     EMAIL_VERIFY_PROVIDER = zerobounce | neverbounce | emailable | bouncer |
+                             abstract | mailboxlayer
+     EMAIL_VERIFY_API_KEY  = <your api key>
+
+   With those present, Gmail/Outlook mailboxes are verified for real on Railway
+   and a non-existent address such as A1TOWLLC916@gmail.com comes back Invalid.
+   -------------------------------------------------------------------------- */
+
+const SUPPORTED_VERIFY_PROVIDERS = [
+  'zerobounce', 'neverbounce', 'emailable', 'bouncer', 'abstract', 'mailboxlayer'
+];
+
+const VERIFY_PROVIDER = (process.env.EMAIL_VERIFY_PROVIDER || '').trim().toLowerCase();
+const VERIFY_API_KEY = (process.env.EMAIL_VERIFY_API_KEY || '').trim();
+const VERIFY_TIMEOUT_MS = Number(process.env.EMAIL_VERIFY_TIMEOUT_MS || 20000);
+
+const providerSupported = SUPPORTED_VERIFY_PROVIDERS.includes(VERIFY_PROVIDER);
+const providerConfigured = providerSupported && VERIFY_API_KEY.length > 0;
+
+interface ProviderVerdict {
+  outcome: MailboxOutcome;
+  reason: string;
+}
+
+// Minimal JSON GET helper — no extra dependency needed.
+const httpsGetJson = (
+  url: string,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; body: any; raw: string }> => {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      url,
+      {
+        headers: {
+          accept: 'application/json',
+          'user-agent': 'EquinoxMail-Validator/2.0',
+          ...headers
+        },
+        timeout: VERIFY_TIMEOUT_MS
+      },
+      (resp) => {
+        let raw = '';
+        resp.setEncoding('utf8');
+        resp.on('data', (chunk) => {
+          raw += chunk;
+          if (raw.length > 512 * 1024) {
+            req.destroy(new Error('Verification response too large'));
+          }
+        });
+        resp.on('end', () => {
+          let body: any = null;
+          try {
+            body = raw ? JSON.parse(raw) : null;
+          } catch (e) {
+            body = null;
+          }
+          resolve({ status: resp.statusCode || 0, body, raw });
+        });
+      }
+    );
+
+    req.on('timeout', () => req.destroy(new Error('Verification provider timed out')));
+    req.on('error', (err) => reject(err));
+  });
+};
+
+const providerLabel = () => VERIFY_PROVIDER.charAt(0).toUpperCase() + VERIFY_PROVIDER.slice(1);
+
+// Normalises each provider's own vocabulary into our four outcomes.
+const verifyViaProvider = async (email: string, domain: string): Promise<ProviderVerdict> => {
+  const enc = encodeURIComponent(email);
+  const key = encodeURIComponent(VERIFY_API_KEY);
+  const label = providerLabel();
+
+  if (VERIFY_PROVIDER === 'zerobounce') {
+    const { body } = await httpsGetJson(
+      `https://api.zerobounce.net/v2/validate?api_key=${key}&email=${enc}&ip_address=`
+    );
+    if (!body) throw new Error('ZeroBounce returned an unreadable response');
+    if (body.error) throw new Error(String(body.error));
+
+    const status = String(body.status || '').toLowerCase();
+    const sub = body.sub_status ? ` (${body.sub_status})` : '';
+
+    if (status === 'valid') return { outcome: 'valid', reason: `Mailbox confirmed by ${label} (SMTP verified)` };
+    if (status === 'invalid') return { outcome: 'invalid', reason: `Mailbox does not exist — ${label} reports invalid${sub}` };
+    if (status === 'catch-all') return { outcome: 'catchall', reason: `${domain} accepts every address (catch-all) — existence cannot be confirmed` };
+    if (status === 'spamtrap') return { outcome: 'invalid', reason: `Spam trap address — ${label} advises never mailing it` };
+    if (status === 'abuse' || status === 'do_not_mail') {
+      return { outcome: 'risky', reason: `${label} flagged this address as ${status.replace('_', ' ')}${sub} — sending is not advised` };
+    }
+    return { outcome: 'unknown', reason: `${label} could not determine the mailbox status${sub}` };
+  }
+
+  if (VERIFY_PROVIDER === 'neverbounce') {
+    const { body } = await httpsGetJson(
+      `https://api.neverbounce.com/v4/single/check?key=${key}&email=${enc}&address_info=false&credits_info=false&timeout=15`
+    );
+    if (!body) throw new Error('NeverBounce returned an unreadable response');
+    if (body.status && body.status !== 'success') {
+      throw new Error(body.message || `NeverBounce error: ${body.status}`);
+    }
+
+    const result = String(body.result || '').toLowerCase();
+    if (result === 'valid') return { outcome: 'valid', reason: `Mailbox confirmed by ${label} (SMTP verified)` };
+    if (result === 'invalid') return { outcome: 'invalid', reason: `Mailbox does not exist — ${label} reports invalid` };
+    if (result === 'disposable') return { outcome: 'invalid', reason: `Disposable/temporary inbox detected by ${label}` };
+    if (result === 'catchall') return { outcome: 'catchall', reason: `${domain} accepts every address (catch-all) — existence cannot be confirmed` };
+    return { outcome: 'unknown', reason: `${label} could not determine the mailbox status` };
+  }
+
+  if (VERIFY_PROVIDER === 'emailable') {
+    const { status, body } = await httpsGetJson(
+      `https://api.emailable.com/v1/verify?email=${enc}&api_key=${key}&smtp=true`
+    );
+    // 249 means the check is still running on their side.
+    if (status === 249) return { outcome: 'unknown', reason: `${label} check is still pending — retry in a moment` };
+    if (!body) throw new Error('Emailable returned an unreadable response');
+    if (body.message && !body.state) throw new Error(String(body.message));
+
+    const state = String(body.state || '').toLowerCase();
+    const why = body.reason ? ` (${body.reason})` : '';
+
+    if (state === 'deliverable') return { outcome: 'valid', reason: `Mailbox confirmed by ${label} (SMTP verified)` };
+    if (state === 'undeliverable') return { outcome: 'invalid', reason: `Mailbox does not exist — ${label} reports undeliverable${why}` };
+    if (state === 'risky') {
+      if (body.accept_all) return { outcome: 'catchall', reason: `${domain} accepts every address (catch-all) — existence cannot be confirmed` };
+      return { outcome: 'risky', reason: `${label} rates this address risky${why}` };
+    }
+    return { outcome: 'unknown', reason: `${label} could not determine the mailbox status${why}` };
+  }
+
+  if (VERIFY_PROVIDER === 'bouncer') {
+    const { body } = await httpsGetJson(
+      `https://api.usebouncer.com/v1.1/email/verify?email=${enc}&timeout=20`,
+      { 'x-api-key': VERIFY_API_KEY }
+    );
+    if (!body) throw new Error('Bouncer returned an unreadable response');
+    if (body.error || (body.message && !body.status)) {
+      throw new Error(String(body.error || body.message));
+    }
+
+    const status = String(body.status || '').toLowerCase();
+    const why = body.reason ? ` (${body.reason})` : '';
+    const acceptAll = String(body?.domain?.acceptAll || '').toLowerCase() === 'yes';
+
+    if (status === 'deliverable') return { outcome: 'valid', reason: `Mailbox confirmed by ${label} (SMTP verified)` };
+    if (status === 'undeliverable') return { outcome: 'invalid', reason: `Mailbox does not exist — ${label} reports undeliverable${why}` };
+    if (status === 'risky') {
+      if (acceptAll) return { outcome: 'catchall', reason: `${domain} accepts every address (catch-all) — existence cannot be confirmed` };
+      return { outcome: 'risky', reason: `${label} rates this address risky${why}` };
+    }
+    return { outcome: 'unknown', reason: `${label} could not determine the mailbox status${why}` };
+  }
+
+  if (VERIFY_PROVIDER === 'abstract') {
+    const { body } = await httpsGetJson(
+      `https://emailvalidation.abstractapi.com/v1/?api_key=${key}&email=${enc}`
+    );
+    if (!body) throw new Error('Abstract API returned an unreadable response');
+    if (body.error) throw new Error(String(body.error?.message || body.error));
+
+    const deliverability = String(body.deliverability || '').toUpperCase();
+    const smtpValid = body?.is_smtp_valid?.value;
+
+    if (deliverability === 'DELIVERABLE') return { outcome: 'valid', reason: `Mailbox confirmed by ${label} (SMTP verified)` };
+    if (deliverability === 'UNDELIVERABLE') return { outcome: 'invalid', reason: `Mailbox does not exist — ${label} reports undeliverable` };
+    if (deliverability === 'RISKY') {
+      if (body?.is_catchall_email?.value) return { outcome: 'catchall', reason: `${domain} accepts every address (catch-all) — existence cannot be confirmed` };
+      return { outcome: 'risky', reason: `${label} rates this address risky` };
+    }
+    if (smtpValid === false) return { outcome: 'invalid', reason: `Mailbox rejected at SMTP level according to ${label}` };
+    return { outcome: 'unknown', reason: `${label} could not determine the mailbox status` };
+  }
+
+  if (VERIFY_PROVIDER === 'mailboxlayer') {
+    const { body } = await httpsGetJson(
+      `https://apilayer.net/api/check?access_key=${key}&email=${enc}&smtp=1&format=1`
+    );
+    if (!body) throw new Error('Mailboxlayer returned an unreadable response');
+    if (body.success === false) throw new Error(String(body.error?.info || 'Mailboxlayer request rejected'));
+
+    if (body.mx_found === false) return { outcome: 'invalid', reason: 'No MX records found — this domain cannot receive mail' };
+    if (body.catch_all === true) return { outcome: 'catchall', reason: `${domain} accepts every address (catch-all) — existence cannot be confirmed` };
+    if (body.smtp_check === true) return { outcome: 'valid', reason: `Mailbox confirmed by ${label} (SMTP verified)` };
+    if (body.smtp_check === false) return { outcome: 'invalid', reason: `Mailbox does not exist — ${label} SMTP check failed` };
+    return { outcome: 'unknown', reason: `${label} could not determine the mailbox status` };
+  }
+
+  throw new Error(`Unsupported EMAIL_VERIFY_PROVIDER "${VERIFY_PROVIDER}"`);
+};
+
+// Shared mapping from an internal verdict to the API response shape.
+const finalizeVerdict = (
+  email: string,
+  domain: string,
+  localPart: string,
+  verdict: ProviderVerdict
+) => {
+  if (verdict.outcome === 'invalid') {
+    return makeResult(email, 'invalid', verdict.reason, domain, false);
+  }
+  if (verdict.outcome === 'catchall') {
+    return makeResult(email, 'risky', verdict.reason, domain, true);
+  }
+  if (verdict.outcome === 'valid') {
+    const roleNote = ROLE_PREFIXES.includes(localPart.toLowerCase())
+      ? ' — role-based address, not a personal inbox'
+      : '';
+    return makeResult(email, 'valid', verdict.reason + roleNote, domain, true);
+  }
+  return makeResult(email, 'risky', verdict.reason, domain, false);
+};
+
+// Human-readable description of the active verification mode.
+const describeVerifyMode = async () => {
+  if (providerConfigured) {
+    return {
+      mode: 'provider' as const,
+      provider: VERIFY_PROVIDER,
+      ready: true,
+      detail: `Real mailbox verification is active via ${providerLabel()} over HTTPS (works on Railway).`
+    };
+  }
+
+  if (providerSupported && !VERIFY_API_KEY) {
+    return {
+      mode: 'unconfigured' as const,
+      provider: VERIFY_PROVIDER,
+      ready: false,
+      detail: `EMAIL_VERIFY_PROVIDER is set to "${VERIFY_PROVIDER}" but EMAIL_VERIFY_API_KEY is missing.`
+    };
+  }
+
+  if (VERIFY_PROVIDER && !providerSupported) {
+    return {
+      mode: 'unconfigured' as const,
+      provider: VERIFY_PROVIDER,
+      ready: false,
+      detail: `Unknown EMAIL_VERIFY_PROVIDER "${VERIFY_PROVIDER}". Supported: ${SUPPORTED_VERIFY_PROVIDERS.join(', ')}.`
+    };
+  }
+
+  const outbound = await checkOutboundSmtp();
+  return {
+    mode: 'smtp' as const,
+    provider: null,
+    ready: outbound.ok,
+    detail: outbound.ok
+      ? 'Real mailbox verification is active via direct SMTP RCPT TO on port 25.'
+      : `${outbound.detail}. Railway blocks port 25 permanently — set EMAIL_VERIFY_PROVIDER and EMAIL_VERIFY_API_KEY to verify mailboxes over HTTPS instead.`
+  };
 };
 
 // POST /api/validate-emails (requires auth)
