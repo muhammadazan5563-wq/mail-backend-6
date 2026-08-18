@@ -565,7 +565,17 @@ app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
       const firstNames: string[] = [];
       const variables: string[] = [];
 
+      // Deduplicate within the batch by email+listName (case-insensitive)
+      const seenInBatch = new Set<string>();
+
       for (const c of batch) {
+        const email = (c.email || '').trim().toLowerCase();
+        const listName = (c.listName || 'Unassigned').trim().toLowerCase();
+        const dedupeKey = `${email}::${listName}`;
+        
+        if (!email || seenInBatch.has(dedupeKey)) continue;
+        seenInBatch.add(dedupeKey);
+
         ids.push(c.id || Math.random().toString(36).substr(2, 9));
         emails.push((c.email || '').trim());
         names.push((c.name || '').trim());
@@ -575,12 +585,30 @@ app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
         variables.push(JSON.stringify(c.variables || {}));
       }
 
+      if (ids.length === 0) return;
+
+      // Use ON CONFLICT on id for upsert, and skip duplicates that would violate the unique email+list constraint
       await query(
         `INSERT INTO contacts (id, user_id, email, name, list_name, company, first_name, variables)
          SELECT unnest($1::text[]), $2, unnest($3::text[]), unnest($4::text[]), unnest($5::text[]), unnest($6::text[]), unnest($7::text[]), unnest($8::jsonb[])
          ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, list_name = EXCLUDED.list_name, company = EXCLUDED.company, first_name = EXCLUDED.first_name, variables = EXCLUDED.variables`,
         [ids, userId, emails, names, listNames, companies, firstNames, variables]
-      );
+      ).catch(async (err: any) => {
+        // If the unique index on (user_id, LOWER(email), LOWER(list_name)) causes a conflict,
+        // fall back to individual inserts with skip-on-duplicate behavior
+        if (err.code === '23505' && err.constraint?.includes('unique_email_per_list')) {
+          for (let i = 0; i < ids.length; i++) {
+            await query(
+              `INSERT INTO contacts (id, user_id, email, name, list_name, company, first_name, variables)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, list_name = EXCLUDED.list_name, company = EXCLUDED.company, first_name = EXCLUDED.first_name, variables = EXCLUDED.variables`,
+              [ids[i], userId, emails[i], names[i], listNames[i], companies[i], firstNames[i], variables[i]]
+            ).catch(() => { /* skip duplicates */ });
+          }
+        } else {
+          throw err;
+        }
+      });
     };
 
     // Process batches with controlled concurrency
@@ -751,14 +779,30 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
 
       if (updates.status === 'running' && campaign.status !== 'running') {
         await query('UPDATE campaigns SET started_at = COALESCE(started_at, NOW()) WHERE id = $1', [id]);
-        // Run queue initialization in the background — don't block the API response
-        initializeCampaignQueue(campaign, userId)
-          .catch((e: any) => console.error('Async queue init error:', e));
+
+        // Fetch the LATEST campaign data (including any template edits made while stopped)
+        const freshCampaignResult = await query('SELECT * FROM campaigns WHERE id = $1', [id]);
+        const freshCampaign = freshCampaignResult.rows[0];
+
+        if (campaign.status === 'stopped') {
+          // Coming from stopped state: clear the entire queue and rebuild fresh
+          // This ensures edited templates are applied and no duplicates are sent
+          await query('DELETE FROM email_queue WHERE campaign_id = $1', [id]);
+          // Reset counters since we're starting fresh
+          await query('UPDATE campaigns SET sent_count = 0, success_count = 0, failed_count = 0 WHERE id = $1', [id]);
+          // Run queue initialization in the background with fresh campaign data
+          initializeCampaignQueue(freshCampaign, userId)
+            .catch((e: any) => console.error('Async queue init error (from stopped):', e));
+        } else {
+          // Coming from paused/draft state: resume existing queue
+          initializeCampaignQueue(freshCampaign, userId)
+            .catch((e: any) => console.error('Async queue init error:', e));
+        }
       }
 
-      // For stop/pause: clean up the email queue asynchronously so the response is not blocked
+      // For stop: clean up ALL email queue items (pending, paused, sending) so a fresh start is possible
       if (updates.status === 'stopped') {
-        query('DELETE FROM email_queue WHERE campaign_id = $1 AND status = $2', [id, 'pending'])
+        query('DELETE FROM email_queue WHERE campaign_id = $1 AND status IN ($2, $3, $4)', [id, 'pending', 'paused', 'sending'])
           .catch((e: any) => console.error('Async queue cleanup error (stopped):', e));
       } else if (updates.status === 'paused') {
         query("UPDATE email_queue SET status = 'paused' WHERE campaign_id = $1 AND status = 'pending'", [id])
@@ -1615,8 +1659,9 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
   }
 
   // Find contacts for this campaign — use cursor-style pagination to avoid loading all into memory
+  // Use DISTINCT ON (email) to prevent sending duplicate emails to the same recipient
   const countResult = await query(
-    'SELECT COUNT(*) as total FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2)',
+    'SELECT COUNT(*) as total FROM (SELECT DISTINCT ON (LOWER(email)) id FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2)) as unique_contacts',
     [userId, campaign.contact_list_name]
   );
   const totalAvailable = parseInt(countResult.rows[0].total);
@@ -1642,11 +1687,13 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
   const QUEUE_BATCH_SIZE = 1000;
   let globalIdx = 0;
   let offset = 0;
+  // Track emails already queued to prevent any duplicates across batches
+  const queuedEmails = new Set<string>();
 
   while (globalIdx < limit) {
     const batchLimit = Math.min(QUEUE_BATCH_SIZE, limit - globalIdx);
     const contactsBatch = await query(
-      'SELECT * FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2) ORDER BY created_at ASC LIMIT $3 OFFSET $4',
+      'SELECT DISTINCT ON (LOWER(email)) * FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2) ORDER BY LOWER(email), created_at ASC LIMIT $3 OFFSET $4',
       [userId, campaign.contact_list_name, batchLimit, offset]
     );
 
@@ -1664,6 +1711,10 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
     const delayUntils: number[] = [];
 
     for (const contact of contactsBatch.rows) {
+      // Skip if this email was already queued (safety net for cross-batch duplicates)
+      const emailKey = (contact.email || '').toLowerCase().trim();
+      if (queuedEmails.has(emailKey)) continue;
+      queuedEmails.add(emailKey);
       let senderEmail = '';
       if (campaign.type === 'normal') {
         senderEmail = campaign.sender_email || '';
@@ -1778,34 +1829,55 @@ async function sendGmailApi(userId: number, senderEmail: string, recipientEmail:
   return await sendRes.json();
 }
 
+// Guard to prevent overlapping dispatch ticks
+let dispatchInProgress = false;
+
 // Background queue dispatcher
 async function executeEmailDispatchTick() {
+  // Prevent concurrent tick executions — if a tick is already running, skip this one
+  if (dispatchInProgress) return;
+  dispatchInProgress = true;
+
   try {
     const activeCampaigns = await query("SELECT * FROM campaigns WHERE status = 'running'");
 
     if (activeCampaigns.rows.length === 0) return;
 
     for (const campaign of activeCampaigns.rows) {
-      const pendingItems = await query(
-        "SELECT * FROM email_queue WHERE campaign_id = $1 AND status = 'pending' AND delay_until <= $2 ORDER BY delay_until ASC LIMIT 3",
+      // Atomically claim pending items by updating their status to 'sending' in one query
+      // This prevents race conditions where multiple ticks pick up the same items
+      const claimedItems = await query(
+        `UPDATE email_queue SET status = 'sending'
+         WHERE id IN (
+           SELECT id FROM email_queue
+           WHERE campaign_id = $1 AND status = 'pending' AND delay_until <= $2
+           ORDER BY delay_until ASC
+           LIMIT 3
+         )
+         RETURNING *`,
         [campaign.id, Date.now()]
       );
 
-      if (pendingItems.rows.length === 0) {
+      if (claimedItems.rows.length === 0) {
         // Check if all items are processed (exclude paused — those are waiting for resume)
         const remaining = await query(
           "SELECT COUNT(*) as count FROM email_queue WHERE campaign_id = $1 AND status IN ('pending', 'paused')",
           [campaign.id]
         );
         if (parseInt(remaining.rows[0].count) === 0) {
-          await query("UPDATE campaigns SET status = 'completed' WHERE id = $1", [campaign.id]);
+          // Also check no items are currently being sent
+          const sending = await query(
+            "SELECT COUNT(*) as count FROM email_queue WHERE campaign_id = $1 AND status = 'sending'",
+            [campaign.id]
+          );
+          if (parseInt(sending.rows[0].count) === 0) {
+            await query("UPDATE campaigns SET status = 'completed' WHERE id = $1", [campaign.id]);
+          }
         }
         continue;
       }
 
-      for (const item of pendingItems.rows) {
-        await query("UPDATE email_queue SET status = 'sending' WHERE id = $1", [item.id]);
-
+      for (const item of claimedItems.rows) {
         try {
           await sendGmailApi(campaign.user_id, item.sender_email, item.recipient_email, item.recipient_name, item.subject, item.body, campaign.sender_name || undefined, campaign.reply_to || undefined);
 
@@ -1839,6 +1911,8 @@ async function executeEmailDispatchTick() {
     }
   } catch (err) {
     console.error('Queue Dispatch Tick Error:', err);
+  } finally {
+    dispatchInProgress = false;
   }
 }
 
